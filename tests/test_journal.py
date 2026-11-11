@@ -246,6 +246,7 @@ class BtOut(unittest.TestCase):
         self.assertIn('pcm "hw:Loopback,0,0"', conf)
         self.assertNotIn("bluealsa", conf)
         self.assertIn("card 0", conf)                     # без карты softvol плеер Алисы не открывает вывод
+        self.assertIn('pcm.!dmix_spk_plug {\n  type softvol', conf)  # регулятор на пути, который открывает Алиса
         self.assertIn(server.BTOUT_MARK, conf)
         self.assertTrue(conf.startswith("pcm.!default"))  # исходная настройка — целиком, подмена дописана в конец
         self.assertEqual(self.pushed[server.BTOUT_MAC].strip(), self.MAC)
@@ -253,7 +254,16 @@ class BtOut(unittest.TestCase):
         self.assertTrue(any(f"mount --bind {server.BTOUT_CONF} /etc/asound.conf" in c for c in self.cmds))   # сразу, не ждём сторожа
         self.assertTrue(any("q restart" in c for c in self.cmds))
         sh = self.pushed[server.BTOUT_SH]
+        voice = self.pushed[server.BTOUT_VOICE]
         self.assertNotIn("__", sh)
+        self.assertNotIn("__", voice)
+        self.assertIn(server.BTOUT_PHRASE_ON, voice)
+        self.assertIn(server.BTOUT_PHRASE_OFF, voice)
+        self.assertIn("recognizedPhrase", voice)
+        import shutil
+        import subprocess
+        if shutil.which("sh"):
+            self.assertEqual(subprocess.run(["sh", "-n"], input=voice.encode()).returncode, 0)
         self.assertIn("dev_$(echo", sh)
         self.assertIn("aplay -q -D bluealsa:DEV=$M,PROFILE=a2dp", sh)
         self.assertIn("arecord -q -D hw:Loopback,1,0", sh)
@@ -261,12 +271,12 @@ class BtOut(unittest.TestCase):
         code = "\n".join(l for l in sh.splitlines() if not l.lstrip().startswith("#"))
         self.assertNotIn("bluetoothctl", code)   # сторож проверяет по D-Bus, без утечки
         self.assertTrue(any("start-stop-daemon -S" in c and server.BTOUT_SH in c for c in self.cmds))
-        import subprocess
-        self.assertEqual(subprocess.run(["sh", "-n"], input=sh.encode()).returncode, 0)
+        if shutil.which("sh"):
+            self.assertEqual(subprocess.run(["sh", "-n"], input=sh.encode()).returncode, 0)
         p.adb.shell = lambda cmd, *a, **k: (self.cmds.append(cmd), ("changed" if "umount" in cmd else "", "", 0))[1]
         self.cmds.clear(); p.btout_off()
         self.assertTrue(any("umount /etc/asound.conf" in c for c in self.cmds) and any("q restart" in c for c in self.cmds))
-        self.assertFalse(any(server.BTOUT_LAST in c for c in self.cmds))   # последнюю колонку помним
+        self.assertFalse(any(f"rm -f {server.BTOUT_LAST}" in c or f"rm {server.BTOUT_LAST}" in c for c in self.cmds))
         # подмены не было (колонку ждали) — Алису зря не перезапускаем
         p.adb.shell = lambda cmd, *a, **k: (self.cmds.append(cmd), ("", "", 0))[1]
         self.cmds.clear(); self.assertFalse(p.btout_off()["restarted"])

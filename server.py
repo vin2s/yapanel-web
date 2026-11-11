@@ -543,6 +543,8 @@ BTOUT_SD = "/tmp/webpanel_btout.sd"
 BTOUT_STATE = "/tmp/webpanel_btout.state"   # bt — играет через неё; waiting — ждём её, звук на встроенном
 BTOUT_MARK = "# webpanel: btout"
 BTOUT_FWD_SD = "/tmp/webpanel_btfwd.sd"
+BTOUT_VOICE = f"{BTOUT_DIR}/voice.sh"   # слушает фразы Алисы и без компьютера переключает выход
+BTOUT_VOICE_SD = "/tmp/webpanel_btvoice.sd"
 BTOUT_WATCH = r"""#!/bin/sh
 # Веб-панель: звук через Bluetooth-колонку. Bluetooth-выход принимает один поток, а у Алисы голос и музыка —
 # разные плееры, поэтому звук смешивается как обычно (dmix), только не в динамик, а в виртуальную петлю
@@ -599,6 +601,97 @@ ours && { umount /etc/asound.conf || umount -l /etc/asound.conf; quasar; }
 rm -f $S
 """
 
+# Фразы Алисы (слово «Алиса» в журнал уже не попадает). Первая буква отброшена, чтобы совпали
+# «Переключи» и «переключи». Скрипт живёт на колонке: панель для переключения не нужна.
+BTOUT_PHRASE_ON = "ереключи звук на саундбар"
+BTOUT_PHRASE_ON2 = "ереключи звук на саунд бар"
+BTOUT_PHRASE_OFF = "ерни звук в колонку"
+BTOUT_PHRASE_OFF2 = "ерни звук на колонку"
+BTOUT_VOICE_SH = r"""#!/bin/sh
+# Веб-панель: «Алиса, переключи звук на саундбар» / «Алиса, верни звук в колонку».
+D=__DIR__
+WSD=__WSD__
+F=__FWD__
+S=__STATE__
+LOG=/data/quasar/daemons_logs/maind.log
+Q=/system/vendor/quasar
+STAMP=/tmp/webpanel_btvoice.stamp
+cancel() {
+  ( sleep 1; printf 'c\nx\n'; sleep 1 ) | LD_LIBRARY_PATH=$Q/libs $Q/maind --cli >/dev/null 2>&1 &
+}
+fresh() {  # одну и ту же фразу журнал пишет несколько раз подряд: 0 — повторять не надо
+  now=$(date +%s); key=$1
+  prev=$(cat $STAMP 2>/dev/null)
+  echo "$now $key" > $STAMP
+  set -- $prev
+  [ "$2" = "$key" ] && [ $((now - ${1:-0})) -lt 8 ]
+}
+to_bar() {
+  fresh on && return 0
+  M=$(cat $D/last 2>/dev/null) || return 0
+  printf '%s\n' "$M" > $D/device
+  P=/org/bluez/hci0/dev_$(echo "$M" | tr : _)
+  dbus-send --system --dest=org.bluez "$P" org.bluez.Device1.Connect >/dev/null 2>&1 &
+  grep -q ' /etc/asound.conf ' /proc/mounts || { mount --bind $D/asound.conf /etc/asound.conf && $Q/q restart >/dev/null 2>&1; }
+  start-stop-daemon -S -b -m -p $WSD -x /bin/sh -- $D/watch.sh 2>/dev/null
+  cancel
+}
+to_speaker() {
+  fresh off && return 0
+  rm -f $D/device
+  start-stop-daemon -K -p $WSD 2>/dev/null
+  p=$(cat $F 2>/dev/null) && g=$(awk '{print $5}' /proc/$p/stat 2>/dev/null) && [ "${g:-0}" -gt 1 ] && kill -- -$g 2>/dev/null
+  rm -f $F $S
+  if grep -q ' /etc/asound.conf ' /proc/mounts && grep -q '__MARK__' /etc/asound.conf; then
+    umount /etc/asound.conf || umount -l /etc/asound.conf
+    $Q/q restart >/dev/null 2>&1
+  fi
+  cancel
+}
+while true; do
+  [ -f "$LOG" ] || { sleep 2; continue; }
+  tail -n 0 -F "$LOG" 2>/dev/null | while IFS= read -r line; do
+    case $line in *recognizedPhrase=*) ;; *) continue ;; esac
+    phrase=$(printf '%s\n' "$line" | sed -n "s/.*recognizedPhrase='\([^']*\)'.*/\1/p")
+    # grep -F сравнивает байты: case в оболочке колонки UTF-8 режет
+    printf '%s\n' "$phrase" | grep -a -F -q "__ON__" && to_bar
+    printf '%s\n' "$phrase" | grep -a -F -q "__ON2__" && to_bar
+    printf '%s\n' "$phrase" | grep -a -F -q "__OFF__" && to_speaker
+    printf '%s\n' "$phrase" | grep -a -F -q "__OFF2__" && to_speaker
+  done
+  sleep 2
+done
+"""
+
+
+def btout_asound_conf(original):
+    """Исходный asound.conf плюс петля. Регулятор Master стоит на dmix_spk_plug: его открывает плеер Алисы."""
+    bare = (
+        '  playback.pcm {\n    type softvol\n    slave.pcm "dmix_spk_plug"\n\n'
+        '    control {\n      name "Master Playback Volume"\n    }\n  }'
+    )
+    if bare in original:
+        original = original.replace(bare, '  playback.pcm "dmix_spk_plug"', 1)
+    return original.rstrip("\n") + (
+        f"\n\n{BTOUT_MARK} — смешивание в петлю snd-aloop, в Bluetooth-колонку переливает сторож\n"
+        "pcm.!speakers {\n  type softvol\n  min_dB -60.0\n  slave.pcm \"playback_metrics_tap\"\n"
+        "  control {\n    name \"Master Playback Volume\"\n    card 0\n  }\n}\n"
+        "pcm.!dmix_spk_plug {\n  type softvol\n  min_dB -60.0\n  slave.pcm \"dmix_loop_plug\"\n"
+        "  control {\n    name \"Master Playback Volume\"\n    card 0\n  }\n}\n"
+        "pcm.dmix_loop_plug {\n  type plug\n  slave.pcm \"dmix_loop\"\n}\n"
+        "pcm.dmix_loop {\n  type dmix\n  ipc_key 1031\n  ipc_key_add_uid false\n  ipc_perm 0666\n"
+        "  slave {\n    pcm \"hw:Loopback,0,0\"\n    channels 2\n    rate 48000\n    buffer_size 7680\n    period_size 960\n  }\n}\n")
+
+
+def btout_scripts():
+    watch = (BTOUT_WATCH.replace("__DIR__", BTOUT_DIR).replace("__STATE__", BTOUT_STATE).replace("__MARK__", BTOUT_MARK)
+             .replace("__FWD__", BTOUT_FWD_SD).replace("__VIZ__", VIZD))
+    voice = (BTOUT_VOICE_SH.replace("__DIR__", BTOUT_DIR).replace("__WSD__", BTOUT_SD)
+             .replace("__FWD__", BTOUT_FWD_SD).replace("__STATE__", BTOUT_STATE).replace("__MARK__", BTOUT_MARK)
+             .replace("__ON2__", BTOUT_PHRASE_ON2).replace("__OFF2__", BTOUT_PHRASE_OFF2)
+             .replace("__ON__", BTOUT_PHRASE_ON).replace("__OFF__", BTOUT_PHRASE_OFF))
+    return watch, voice
+
 
 BOOT_HOOK_SCRIPT = (
     "#!/bin/sh\n"
@@ -621,6 +714,7 @@ BOOT_HOOK_SCRIPT = (
     f"[ -f {MIC_DIR}/enabled ] && [ -f {MIC_DIR}/manage.sh ] && "
     f"sh {MIC_DIR}/manage.sh boot >{MIC_DIR}/boot.log 2>&1 &\n"
     f"[ -f {BTOUT_MAC} ] && [ -f {BTOUT_SH} ] && start-stop-daemon -S -b -m -p {BTOUT_SD} -x /bin/sh -- {BTOUT_SH}\n"
+    f"[ -f {BTOUT_LAST} ] && [ -f {BTOUT_VOICE} ] && start-stop-daemon -S -b -m -p {BTOUT_VOICE_SD} -x /bin/sh -- {BTOUT_VOICE}\n"
     # свои слова активации: демон из yam-пакета, стартуем из /data (rootfs-init после OTA пропадает)
     f"[ -f {WAKE_AUTOSTART} ] && [ -x {WAKE_BIN} ] && start-stop-daemon -S -b -m -N 10 -p {WAKE_PID} -x /bin/sh -- -c "
     f"{shlex.quote(f'exec {WAKE_BIN} run -data {WAKE_DATA} -negatives {WAKE_SHARE}/negatives.bin -listen 127.0.0.1:{WAKE_PORT} >> {WAKE_LOG} 2>&1')}\n"
@@ -1167,6 +1261,17 @@ class Connection:
         self.wake = threading.Event()
         self._probe_failures = 0
         self._probe_error = ""
+        self.on_online = None   # один раз, когда колонка только что появилась
+
+    def _came_online(self, msg):
+        fresh = not self.online
+        hook = self.on_online if fresh else None
+        if fresh:
+            self.note(msg)
+        self.attempts = 0
+        self._set("online")
+        if hook:
+            threading.Thread(target=hook, daemon=True, name="on-online").start()
 
     @property
     def online(self):
@@ -1244,10 +1349,7 @@ class Connection:
         while True:
             if self._agent_alive():
                 self._probe_failures = 0
-                if not self.online:
-                    self.note(f"Подключено через агента: {self.adb.serial}")
-                self.attempts = 0
-                self._set("online")
+                self._came_online(f"Подключено через агента: {self.adb.serial}")
                 self._sleep(3)
                 continue
             state, err = self._adb_state()
@@ -1265,10 +1367,7 @@ class Connection:
                 state = ""
             self._probe_failures = 0
             if state == "device":
-                if not self.online:
-                    self.note(f"Подключено: {self.adb.serial or 'устройство по умолчанию'}")
-                self.attempts = 0
-                self._set("online")
+                self._came_online(f"Подключено: {self.adb.serial or 'устройство по умолчанию'}")
                 self._sleep(self.PROBE_INTERVAL)
                 continue
             if not network:
@@ -2710,6 +2809,7 @@ echo @@BLUEZ
     HOOK_USERS = (("заставка", BOOT_CUSTOM), ("звук запуска", SOUND_CUSTOM), ("заставка при каждой загрузке", BOOT_ALWAYS),
                   ("автозапуск yamd", YAM_AUTOSTART), ("будильник", ALARM_CONF), ("блокировка аналитики", HOSTS_CUSTOM),
                   ("ассистент", ASSIST_CONF), ("звук через Bluetooth-колонку", BTOUT_MAC),
+                  ("голос саундбара", BTOUT_LAST),
                   ("защищённое соединение (агент)", AGENT_TOKENS), ("Bluetooth выключен", BT_OFF),
                   ("слова активации", WAKE_AUTOSTART))
 
@@ -6004,31 +6104,27 @@ echo @@BLUEZ
         name = next((i["org.bluez.Device1"].get("Alias") or i["org.bluez.Device1"].get("Name") or ""
                      for i in parse_bluez(strip_ansi(self.adb.shell(BLUEZ_DUMP + "; true", check=False, timeout=20)[0])).values()
                      if i.get("org.bluez.Device1", {}).get("Address") == mac), "")
-        conf = self._original_bytes("/etc/asound.conf").decode("utf-8", "replace").rstrip("\n") + (
-            f"\n\n{BTOUT_MARK} — смешивание в петлю snd-aloop, в Bluetooth-колонку переливает сторож\n"
-            "pcm.!speakers {\n  type softvol\n  min_dB -60.0\n  slave.pcm \"playback_metrics_tap\"\n"
-            "  control {\n    name \"Master Playback Volume\"\n    card 0\n  }\n}\n"
-            "pcm.!dmix_spk_plug {\n  type plug\n  slave.pcm \"dmix_loop\"\n}\n"
-            "pcm.dmix_loop {\n  type dmix\n  ipc_key 1031\n  ipc_key_add_uid false\n  ipc_perm 0666\n"
-            "  slave {\n    pcm \"hw:Loopback,0,0\"\n    channels 2\n    rate 48000\n    buffer_size 7680\n    period_size 960\n  }\n}\n")
-        script = (BTOUT_WATCH.replace("__DIR__", BTOUT_DIR).replace("__STATE__", BTOUT_STATE).replace("__MARK__", BTOUT_MARK)
-                  .replace("__FWD__", BTOUT_FWD_SD).replace("__VIZ__", VIZD))
+        conf = btout_asound_conf(self._original_bytes("/etc/asound.conf").decode("utf-8", "replace"))
+        script, voice = btout_scripts()
         with tempfile.TemporaryDirectory() as td:
             write_unix(Path(td) / "conf", conf)
             write_unix(Path(td) / "sh", script)
+            write_unix(Path(td) / "voice", voice)
             write_unix(Path(td) / "mac", mac + "\n")
             write_unix(Path(td) / "name", re.sub(r"[\r\n]+", " ", name)[:60] + "\n")
             self.adb.shell(f"mkdir -p {BTOUT_DIR}")
             self.adb.push(Path(td) / "conf", BTOUT_CONF)
             self.adb.push(Path(td) / "sh", BTOUT_SH)
+            self.adb.push(Path(td) / "voice", BTOUT_VOICE)
             self.adb.push(Path(td) / "mac", BTOUT_MAC)
             self.adb.push(Path(td) / "mac", BTOUT_LAST)
             self.adb.push(Path(td) / "name", BTOUT_NAME)
         self._ensure_hook()
-        self.adb.shell(f"chmod 755 {BTOUT_SH}; start-stop-daemon -K -p {BTOUT_SD} 2>/dev/null; true", check=False)
+        self.adb.shell(f"chmod 755 {BTOUT_SH} {BTOUT_VOICE}; start-stop-daemon -K -p {BTOUT_SD} 2>/dev/null; true", check=False)
         restarted = self._btout_switch(mount=True)
         # сторож дальше следит за подключением (подмена уже стоит — он её не трогает, пока колонка на связи)
-        self.adb.shell(f"start-stop-daemon -S -b -m -p {BTOUT_SD} -x /bin/sh -- {BTOUT_SH}")
+        self.adb.shell(f"start-stop-daemon -S -b -m -p {BTOUT_SD} -x /bin/sh -- {BTOUT_SH}; "
+                       f"start-stop-daemon -S -b -m -p {BTOUT_VOICE_SD} -x /bin/sh -- {BTOUT_VOICE}")
         self._btout_volume_max()   # громкость BT-колонки в bluealsa — всегда 100 %
         eq_error = ""
         try:
@@ -6037,6 +6133,64 @@ echo @@BLUEZ
             eq_error = str(e)
             JOURNAL.add(f"Эквалайзер не применён: {e}", "warn")
         return {**self.bt_state(), "restarted": restarted, "eq_error": eq_error}
+
+    def btout_sync(self):
+        """Колонка только что появилась по adb: записать на неё текущие скрипты и регулятор громкости.
+
+        Адрес саундбара уже лежит в файле last. Если его нет — писать нечего, вывод ещё ни разу не включали.
+        Уже правильный asound.conf заново не монтируем: смена файла под bind оставляет старый inode.
+        """
+        try:
+            self._btout_sync()
+        except Exception as e:  # noqa: BLE001 — обрыв связи не должен ронять поток подключения
+            JOURNAL.add(f"не записал вывод на саундбар: {e}", "warn")
+
+    def _btout_sync(self):
+        probe = (
+            f"mac=$(cat {BTOUT_LAST} 2>/dev/null); [ -n \"$mac\" ] || exit 0; echo \"@mac $mac\"; "
+            f"grep -q 'slave.pcm \"dmix_loop_plug\"' {BTOUT_CONF} 2>/dev/null && echo @softvol; "
+            f"grep -q ' /etc/asound.conf ' /proc/mounts && grep -q '{BTOUT_MARK}' /etc/asound.conf && echo @mounted; "
+            f"md5sum {BTOUT_SH} {BTOUT_VOICE} 2>/dev/null; true")
+        text = strip_ansi(self.adb.shell(probe, check=False, timeout=25)[0])
+        mac = next((ln.split(None, 1)[1].strip() for ln in text.splitlines() if ln.startswith("@mac ")), "")
+        if not re.fullmatch(r"([0-9A-F]{2}:){5}[0-9A-F]{2}", mac):
+            return
+        remote = {}
+        for ln in text.splitlines():
+            parts = ln.split()
+            if len(parts) == 2 and re.fullmatch(r"[0-9a-f]{32}", parts[0]):
+                remote[parts[1]] = parts[0]
+        watch, voice = btout_scripts()
+        bodies = {BTOUT_SH: watch, BTOUT_VOICE: voice}
+        wrote = False
+        with tempfile.TemporaryDirectory() as td:
+            for path, body in bodies.items():
+                if remote.get(path) == hashlib.md5(body.encode()).hexdigest():
+                    continue
+                local = Path(td) / Path(path).name
+                write_unix(local, body)
+                self.adb.push(local, path)
+                wrote = True
+            if "@softvol" not in text.split():
+                original = self._original_bytes("/etc/asound.conf").decode("utf-8", "replace")
+                write_unix(Path(td) / "asound.conf", btout_asound_conf(original))
+                self.adb.push(Path(td) / "asound.conf", BTOUT_CONF)
+                wrote = True
+                if "@mounted" in text.split():
+                    self.adb.shell(
+                        f"if grep -q ' /etc/asound.conf ' /proc/mounts; then umount /etc/asound.conf || exit 1; fi; "
+                        f"mount --bind {BTOUT_CONF} /etc/asound.conf", check=False)
+                    self.detach("quasar", f"{QUASAR}/q restart >/dev/null 2>&1")
+        self.adb.shell(
+            f"chmod 755 {BTOUT_SH} {BTOUT_VOICE}; "
+            f"p=$(cat {BTOUT_VOICE_SD} 2>/dev/null); kill -0 \"$p\" 2>/dev/null || "
+            f"start-stop-daemon -S -b -m -p {BTOUT_VOICE_SD} -x /bin/sh -- {BTOUT_VOICE}; true", check=False)
+        if wrote:
+            try:
+                self._ensure_hook()
+            except AdbError as e:
+                JOURNAL.add(f"скрипты саундбара записаны, автозапуск не обновлён: {e}", "warn")
+            JOURNAL.add("на колонку записан текущий вывод на саундбар")
 
     def btout_off(self):
         """Встроенный динамик: убираем выбор — сторож снимет подмену, перезапустит Алису и выйдет."""
@@ -7331,6 +7485,8 @@ def main():
     ap.add_argument("--data-dir", default=env("PANEL_DATA_DIR"),
                     help="где хранить токен, пароль, сертификаты и историю (по умолчанию — рядом с server.py) [PANEL_DATA_DIR]")
     ap.add_argument("--open", action="store_true", help="открыть панель в браузере после запуска")
+    ap.add_argument("--sync-btout", action="store_true",
+                    help="дождаться колонку, записать на неё вывод на саундбар и выйти")
     ap.add_argument("--model", choices=[*profiles.PROFILES, "auto"], default=env("PANEL_MODEL", "auto"),
                     help="профиль колонки: lite2, lite, mini3pro, mini3, mini2, station2, midi или auto — определить по плате [PANEL_MODEL]")
     args = ap.parse_args()
@@ -7377,6 +7533,18 @@ def main():
     panel.ymusic = glagol.YandexMusic(panel.auth)
     panel.agent_attach()
     panel.conn = Connection(adb)
+    if args.sync_btout:
+        threading.Thread(target=panel.conn.run, daemon=True, name="adb-connection").start()
+        deadline = time.time() + 90
+        while time.time() < deadline and not panel.conn.online:
+            time.sleep(0.5)
+        if not panel.conn.online:
+            print("колонка не подключилась")
+            raise SystemExit(1)
+        panel.btout_sync()
+        print("вывод на саундбар записан на колонку")
+        raise SystemExit(0)
+    panel.conn.on_online = panel.btout_sync
     panel.leds = LedStream(adb)
     panel.metrics = Metrics(adb, panel.conn)
     threading.Thread(target=panel.metrics.run, daemon=True, name="metrics").start()
